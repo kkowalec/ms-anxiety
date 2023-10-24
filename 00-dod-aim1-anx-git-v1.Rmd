@@ -1,0 +1,1233 @@
+---
+title: "dod-aim1-anx"
+author: "Kaarina Kowalec"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: darkly
+    highlight: monochrome
+    toc: true
+    toc_float:
+      collapsed: true
+      smooth_scroll: true
+---
+
+# Background
+These analyses are related to investigating the association between polygenicity
+of anxiety and comorbid anxiety in multiple sclerosis. This file covers
+the analyses related to the Canadian/USA/UKB datasets
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1. Load libraries & data
+```{r}
+library(tidyverse) # data wrangling
+library(data.table) # text files
+library(haven) # SAS files
+library(readxl) # excel files
+library(gee) # GEE models
+library(metafor) # meta-analyses
+
+set.seed(1234)
+
+# Canada, USA
+load("02_can_usa_processed_perindi_anx_9Jun2023.rdat")  
+# UKB
+load("00-anx-ms-23jan23.rdat")
+
+```
+
+# 2. Prep data phenotypes
+```{r,eval=FALSE}
+can <- can %>%
+  mutate(ad_dsm5 = case_when( scid_ever_panic == 1 | scid_ever_social == 1 |
+      scid_ever_specific == 1 |  scid_ever_GAD == 1  |  scid_ever_anxiety_GMC == 1 |
+        scid_ever_agoraphobia == 1  ~ 1,
+      TRUE ~ 0)
+      )
+
+#Elevated symptoms of anxiety (GAD-7 ≥ 10)
+gad <- read_xls("GAD_04.02.21.xls") %>%
+  as_tibble() %>%
+  filter(total_score_gad>=10) %>%
+  arrange(demo_studyid) %>%
+  group_by(demo_studyid) %>%
+  slice(1) %>% 
+  select(demo_studyid) %>%
+  mutate(gad7_over10=1)
+
+can <- left_join(can,gad)
+
+can <- can %>%
+    mutate(gad7_over10=ifelse(is.na(gad7_over10),0,gad7_over10))
+
+gad7 <- read_xls("GAD_04.02.21.xls") %>%
+  as_tibble() %>%
+  arrange(demo_studyid) %>%
+  group_by(demo_studyid) %>%
+  slice(1) %>% 
+  select(demo_studyid,total_score_gad) 
+
+can <- left_join(can,gad7)
+
+can <- can %>%
+  mutate(aim1a_gad_scid_cidi=case_when(demo_disease == 1 & scid_ever_GAD==1 ~ 1, # MS and SCID dx GAD
+                        demo_disease==1 & scid_ever_GAD==0 ~ 0,
+                        TRUE~NA_real_),
+         aim1a_ad_dsm5_scid_icd_cidi=case_when(demo_disease == 1 & ad_dsm5==1 ~ 1,  # MS and SCID dx AD dsm5
+                        demo_disease==1 & ad_dsm5 == 0 ~ 0,
+                        TRUE~NA_real_),
+         aim1a_selfrepAnx=case_when(demo_disease == 1 & demo_anxiety==1 ~ 1,  # MS and self report anxiety
+                        demo_disease==1 & demo_anxiety == 0 ~ 0,
+                        TRUE~NA_real_),
+         aim1a_gad7_over10=case_when(demo_disease == 1 & gad7_over10==1 ~ 1,  # MS and gad-7 over 10
+                        demo_disease==1 & gad7_over10==0 ~ 0,
+                        TRUE~NA_real_))
+
+can <- can %>% # aim1b : ms/anx vs. anx/no ms
+ mutate(aim1b_gad_scid_cidi=case_when(demo_disease == 1 & scid_ever_GAD==1 ~ 1, # MS and SCID dx GAD
+                        demo_disease==5 & scid_ever_GAD==1 ~ 0, # no MS, but w SCID GAD
+                        TRUE~NA_real_),
+         aim1b_ad_dsm5_scid_icd_cidi=case_when(demo_disease == 1 & ad_dsm5==1 ~ 1,  # MS and SCID dx AD dsm5
+                        demo_disease==5 & ad_dsm5==1 ~ 0,
+                        TRUE~NA_real_),
+         aim1b_selfrepAnx=case_when(demo_disease == 1 & demo_anxiety==1 ~ 1,  # MS and self report anxiety
+                        demo_disease==5 & demo_anxiety==1 ~ 0,
+                        TRUE~NA_real_),
+         aim1b_gad7_over10=case_when(demo_disease == 1 & gad7_over10==1 ~ 1,  # MS and gad-7 over 10
+                        demo_disease==5 & gad7_over10==1 ~ 0,
+                        TRUE~NA_real_)
+         )
+   
+can <- can %>% #aim1c: ms anx vs HC
+  mutate(aim1c_ad_dsm5_scid_icd_cidi=case_when(demo_disease == 1 & ad_dsm5==1 ~ 1, # MS and SCID Dx AD dsm5
+                        demo_disease==6 ~ 0, # hc
+                        TRUE~NA_real_),
+         aim1c_selfrepAnx=case_when(demo_disease == 1 & demo_anxiety==1 ~ 1,  # MS and self rep ANX
+                        demo_disease==6 ~ 0, # hc
+                        TRUE~NA_real_),
+         aim1c_gad7_over10=case_when(demo_disease == 1 & gad7_over10==1 ~ 1,  # MS and GAD7>=10
+                        demo_disease==6 ~ 0, # hc
+                        TRUE~NA_real_)
+         )
+
+                                      
+# fix education cat
+# 1, Elementary school | 2, Junior High school | 3, High school diploma/GED | 4, College | 5, Technical/Trade | 6, University bachelor degree | 7, University master's degree | 8, University doctorate | 9, Other | 10, Refuse to answer
+
+can1 <- can1 %>%
+  mutate(demo_educ_cat = case_when(demo_educ <= 3 ~ 0,
+                                   demo_educ >= 4 & demo_educ <= 8 ~ 1,
+                                   demo_educ == 9 ~ 2,
+                                   demo_educ == 10 ~ 3,
+                                   TRUE ~ NA_real_))
+
+can1 <- can1 %>% 
+        mutate(bmi_cat2 = case_when(BMI <= 24.99999 ~ 0, # healthy
+                              (BMI >= 25 & BMI <= 29.99999) ~ 1, # overwt
+                              BMI >= 30 ~ 2, #obese
+                              TRUE ~ NA_real_))
+
+usa1 <- usa1 %>%
+        mutate( bmi_cat2 = case_when(BMI <= 24.99999 ~ 0, # healthy
+                              (BMI >= 25 & BMI <= 29.99999) ~ 1, # overwt
+                              BMI >= 30 ~ 2, #obese
+                              TRUE ~ NA_real_
+                              ))
+
+```
+
+# 3. Polygenic scores
+
+```{r,Canada}
+
+library(DescTools) # for Nagelkerke R2
+
+################################################################################
+####### Selection of GAD-2 PGS  ###### ###### ###### ###### ###### ###
+################################################################################
+# Canada
+# null
+test <- lm(gad2_comp ~ PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,subset=demo_disease==1) # MS only
+summary(test)
+
+# S1
+test <- lm(gad2_comp ~ z_anx.s1 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,subset=demo_disease==1)
+summary(test)
+
+# S2
+test <- lm(gad2_comp ~ z_anx.s2 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,subset=demo_disease==1)
+summary(test)
+
+# S3 #HIGHEST
+test <- lm(gad2_comp ~ z_anx.s3 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,subset=demo_disease==1)
+summary(test)
+
+# S4
+test <- lm(gad2_comp ~ z_anx.s4 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,subset=demo_disease==1)
+summary(test)
+
+# S5
+test <- lm(gad2_comp ~ z_anx.s5 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,subset=demo_disease==1)
+summary(test)
+
+# S6
+test <- lm(gad2_comp ~ z_anx.s6 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,subset=demo_disease==1)
+summary(test)
+
+# S7
+test <- lm(gad2_comp ~ z_anx.s7 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,subset=demo_disease==1)
+summary(test)
+
+# S8
+test <- lm(gad2_comp ~ z_anx.s8 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,subset=demo_disease==1)
+summary(test)
+
+
+```
+
+```{r USA}
+
+### USA
+# NULL
+test <- glm(as.factor(status_a) ~ PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=usa1, family="binomial")
+PseudoR2(test, which="Nagelkerke")
+
+
+################################################################################
+####### Selection of ANX PRS pT -GAD2  ###### ###### ###### ###### ###### ###
+################################################################################
+
+# S1
+test <- glm(as.factor(status_a) ~ z_anx.s1 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=usa1, family="binomial")
+PseudoR2(test, which="Nagelkerke")
+
+# S2
+test <- glm(as.factor(status_a) ~ z_anx.s2 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=usa1, family="binomial")
+PseudoR2(test, which="Nagelkerke")
+
+# S3 
+test <- glm(as.factor(status_a) ~ z_anx.s3 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=usa1, family="binomial")
+PseudoR2(test, which="Nagelkerke")
+
+# S4###HIGHEST R2
+test <- glm(as.factor(status_a) ~ z_anx.s4 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=usa1, family="binomial")
+PseudoR2(test, which="Nagelkerke")
+
+# S5
+test <- glm(as.factor(status_a) ~ z_anx.s5 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=usa1, family="binomial")
+PseudoR2(test, which="Nagelkerke")
+
+# S6
+test <- glm(as.factor(status_a) ~ z_anx.s6 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=usa1, family="binomial")
+PseudoR2(test, which="Nagelkerke")
+
+# S7
+test <- glm(as.factor(status_a) ~ z_anx.s7 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=usa1, family="binomial")
+PseudoR2(test, which="Nagelkerke")
+
+# S8
+test <- glm(as.factor(status_a) ~ z_anx.s8 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=usa1, family="binomial")
+PseudoR2(test, which="Nagelkerke")
+
+```
+
+```{r UKB}
+
+################################################################################
+####### Selection of ANX PRS pT -GAD-2  ###### ###### ###### ###### ###### ###
+################################################################################
+# null
+test <- lm(gad2 ~ PC1 + PC2 + PC3 + PC4 + PC5, data=full,subset=group=="ms")
+summary(test)
+# full
+test <- lm(gad2 ~ anx_2020 + PC1 + PC2 + PC3 + PC4 + PC5, data=full,subset=group=="ms")
+summary(test)
+```
+
+# 4. Table 1-characteristics
+## CANADA
+```{r}
+# CANADA
+library(knitr)
+
+# continuous
+x <- can1 %>%
+  group_by(table1filter) %>%
+  summarise(age=mean(age,na.rm=T),
+            sd_age=sd(age),
+            bmi=mean(BMI),
+            sd_bmi=sd(BMI,na.rm=T),
+            education_yrs=mean(demo_yrs_educ.x),
+            sd_educ_yrs=sd(demo_yrs_educ.x,na.rm=T),
+            gad2_score=mean(gad2_comp,na.rm=T),
+            sd_gad2=sd(gad2_comp,na.rm=T),
+            gad7_score=mean(total_score_gad,na.rm=T),
+            sd_gad7=sd(total_score_gad,na.rm=T),
+            anxGadprs=mean(z_anx.s3),
+            anxGadprs_sd=sd(z_anx.s3)
+           )
+kable(x)
+
+
+# categorical
+
+can1 %>%
+  ungroup() %>%
+  count(demo_gender,table1filter) %>%
+  group_by(table1filter) %>%
+  mutate(percent = n / sum(n) * 100)
+ 
+can1 %>%
+  ungroup() %>%
+  count(bmi_cat2,table1filter) %>% # need cat 1 (overwt) and 2 (obese)
+  group_by(table1filter) %>%
+  mutate(percent = n / sum(n) * 100)
+     
+can1 %>%
+  ungroup() %>%
+  count(demo_educ_cat, table1filter) %>%
+  group_by(table1filter) %>%
+  mutate(percent = n / sum(n) * 100)
+
+can1 %>%
+  ungroup() %>%
+  count(demo_income_cat, table1filter) %>%
+  group_by(table1filter) %>%
+  mutate(percent = n / sum(n) * 100)
+
+can1 %>%
+   ungroup() %>%
+ count(demo_smoker, table1filter) %>%
+  group_by(table1filter) %>%
+  mutate(percent = n / sum(n) * 100)
+
+can1 %>%
+   ungroup() %>%
+ count(ad_dsm5, table1filter) %>%
+  group_by(table1filter) %>%
+  mutate(percent = n / sum(n) * 100)
+
+can1 %>%
+    ungroup() %>%
+count(demo_anxiety, table1filter) %>%
+  group_by(table1filter) %>%
+  mutate(percent = n / sum(n) * 100)
+
+can1 %>%
+  ungroup() %>%
+  count(gad7_over10, table1filter) %>%
+  group_by(table1filter) %>%
+  mutate(percent = n / sum(n) * 100)
+
+```
+## USA
+```{r}
+# continuous
+usa1 %>%
+  group_by(status_a) %>%
+  summarise(age=mean(age,na.rm=T),
+            sd_age=sd(age,na.rm=T),
+            anxGadprs=mean(z_anx.s3),
+            anxGadprs_sd=sd(z_anx.s3),
+            bmi_mean=mean(BMI),
+            bmi_sd=sd(BMI)
+            )
+
+# categorical
+usa1 %>%
+  ungroup() %>%
+  count(gender, status_a) %>%
+  group_by(status_a) %>%
+  mutate(percent = n / sum(n) * 100)
+ 
+usa1 %>%
+  ungroup() %>%
+  count(ed_b, status_a) %>%
+  group_by(status_a) %>%
+  mutate(percent = n / sum(n) * 100)
+ #ed_b = 1 (HS or less), 0 (college or some)
+usa1 %>%
+  ungroup() %>%
+  count(sm_hx, status_a) %>%
+  group_by(status_a) %>%
+  mutate(percent = n / sum(n) * 100)
+
+usa1 %>%
+  ungroup() %>%
+  count(bmi_cat2, status_a) %>%  #  need cat 1 (overwt) and 2 (obese)
+  group_by(status_a) %>%
+  mutate(percent = n / sum(n) * 100)
+
+```
+
+## UKBB
+```{r}
+full <- full %>%
+  mutate(table1filter=case_when(group=="ms" & mhq_sr_anx ==1 ~ "MS-anx",
+                                group=="ms" & mhq_sr_anx == 0 ~ "MS-Noanx",
+                                group=="anx" & mhq_sr_anx == 1~ "ANX",
+                                group == "controls" ~ "healthy",
+                                TRUE ~ NA_character_))
+
+# need other vars (educ, smoking, bmi, income)
+other <- fread("bmi.tsv")
+#smoking =     -3 (prefer not to answer)     0 (never)      1 (previous)      2 (current) [need to combine 1 + 2]
+
+other <- other %>%
+  mutate(eversmoking = case_when(smoking==0 ~ "0",
+                        (smoking==1 |smoking==2) ~ "1",
+                        TRUE ~ NA_character_))
+
+other <- other %>%
+  mutate( bmi_cat2 = case_when(bmi <= 24.99999 ~ 0, # healthy
+                              (bmi >= 25 & bmi <= 29.99999) ~ 1, # overwt
+                              bmi >= 30 ~ 2, #obese
+                              TRUE ~ NA_real_))
+
+other <- other %>%
+  select(f.eid, eversmoking, bmi, bmi_cat2)
+full <- left_join(full,other)
+
+inc <- fread("ukb_edu_years.tsv") 
+full <- left_join(full,inc)
+  
+  
+
+# continuous
+x <- full %>%
+  group_by(table1filter) %>%
+  summarise(age=mean(age,na.rm=T),
+            sd_age=sd(age),
+            bmi=mean(bmi,na.rm=T),
+            sd_bmi=sd(bmi,na.rm=T),
+            education_yrs=mean(edu_years,na.rm=T),
+            sd_educ_yrs=sd(edu_years,na.rm=T),
+            gad2_score=mean(gad2,na.rm=T),
+            sd_gad2=sd(gad2,na.rm=T),
+            gad7_score=mean(tot_score,na.rm=T),
+            sd_gad7=sd(tot_score,na.rm=T),
+            anxGadprs=mean(anx_2020),
+            anxGadprs_sd=sd(anx_2020)
+           )
+
+x <- full %>%
+  group_by(table1filter) %>%
+  summarise(sd_age=sd(age),
+            sd_bmi=sd(bmi,na.rm=T)     )
+
+
+# categorical
+
+full %>%
+  ungroup() %>%
+  count(sex,table1filter) %>%
+  group_by(table1filter) %>%
+  mutate(percent = n / sum(n) * 100)
+ 
+full %>%
+  ungroup() %>%
+  count(bmi_cat2,table1filter) %>% # need cat 1 (overwt) and 2 (obese)
+  group_by(table1filter) %>%
+  mutate(percent = n / sum(n) * 100)
+     
+x <- full %>%
+  ungroup() %>%
+  count(education_level, table1filter) %>%
+  group_by(table1filter) %>%
+  mutate(percent = n / sum(n) * 100)
+
+full %>%
+  ungroup() %>%
+  count(household_income, table1filter) %>%
+  group_by(table1filter) %>%
+  mutate(percent = n / sum(n) * 100)
+
+full %>%
+  ungroup() %>%
+  count(eversmoking, table1filter) %>%
+  group_by(table1filter) %>%
+  mutate(percent = n / sum(n) * 100)
+
+full %>%
+  ungroup() %>%
+  count(dsm_v, table1filter) %>%
+  group_by(table1filter) %>%
+  mutate(percent = n / sum(n) * 100)
+
+
+full %>%
+  ungroup() %>%
+  count(gad7_10, table1filter) %>%
+  group_by(table1filter) %>%
+  mutate(percent = n / sum(n) * 100)
+```
+
+# 5. Regression: PWMS-anx vs PWMS-noanx
+Note: these were run on separate cluster computers due to data sharing restrictions.
+```{r}
+table(can1$aim1a_ad_dsm5_scid_icd_cidi)
+table(can1$aim1a_selfrepAnx)
+table(can1$aim1a_gad7_over10)
+
+######### CANADA
+# Aim 1a - def2 - scid anx dsm5
+test <- glm(as.factor(aim1a_ad_dsm5_scid_icd_cidi) ~ age + demo_gender + z_anx.s3 +
+              PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,
+            family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+# Aim 1a - def5 - self rep anx
+test <- glm(as.factor(aim1a_selfrepAnx) ~ age + demo_gender + z_anx.s3 +
+              PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,
+            family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+# Aim 1a - def6 - gad-7 > 10
+test <- glm(as.factor(aim1a_gad7_over10) ~ age + demo_gender + z_anx.s3 +
+              PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,
+            family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+
+############ usa1
+table(usa1$status_a)
+
+# Aim 1a- def2
+
+test <- glm(as.factor(status_a) ~ age + z_anx.s4 + gender + PC1_3sd +
+              PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=usa1, family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+#### UKBB
+
+
+# outcome 2-DSMV
+test <- glm(as.factor(aim1a_outcome2) ~ age + sex + anx_2020 + PC1 + PC2 + PC3 + PC4 + PC5, data=full,
+            family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+# outcome 5-selfrepANX
+test <- glm(as.factor(aim1a_outcome5) ~ age + sex + anx_2020 + PC1 + PC2 + PC3 + PC4 + PC5, data=full,
+            family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+#outcome 6-GAD7>=10
+test <- glm(as.factor(aim1a_outcome6) ~ age + sex + anx_2020 + PC1 + PC2 + PC3 + PC4 + PC5, data=full,
+            family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+
+######### SEX INTERACTION TERM ##############################################
+######### CANADA
+# Aim 1a - def2 - scid anx dsm5
+test <- glm(as.factor(aim1a_ad_dsm5_scid_icd_cidi) ~ age + demo_gender + z_anx.s3 +
+              PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd + demo_gender*z_anx.s3, data=can1,
+            family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+# Aim 1a - def5 - self rep anx
+test <- glm(as.factor(aim1a_selfrepAnx) ~ age + demo_gender + z_anx.s3 +
+              PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd + demo_gender*z_anx.s3, data=can1,
+            family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+# Aim 1a - def6 - gad-7 > 10
+test <- glm(as.factor(aim1a_gad7_over10) ~ age + demo_gender + z_anx.s3 +
+              PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd + demo_gender*z_anx.s3, data=can1,
+            family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+
+############ usa1
+table(usa1$status_a)
+
+# Aim 1a- def2
+
+test <- glm(as.factor(status_a) ~ age + z_anx.s4 + gender + PC1_3sd +
+              PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd + gender*z_anx.s4, data=usa1, family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+#### UKBB
+# outcome 2-DSMV
+test <- glm(as.factor(aim1a_outcome2) ~ age + sex + anx_2020 + anx_2020*sex + PC1 + PC2 + PC3 + PC4 + PC5, data=full,
+            family="binomial")
+summary(test)
+
+# outcome 5-selfrepANX
+test <- glm(as.factor(aim1a_outcome5) ~ age + sex + anx_2020 + anx_2020*sex + PC1 + PC2 + PC3 + PC4 + PC5, data=full,
+            family="binomial")
+summary(test)
+
+#outcome 6-GAD7>=10
+test <- glm(as.factor(aim1a_outcome6) ~ age + sex + anx_2020 + anx_2020*sex + PC1 + PC2 + PC3 + PC4 + PC5, data=full,
+            family="binomial")
+summary(test)
+```
+
+## Sex stratified analyses
+Note: Gender is in the name of the variables but the biological sex from genetic data was used for the variable
+```{r}
+# demo-gender=1 females
+table(can1$aim1a_ad_dsm5_scid_icd_cidi,can1$demo_gender)
+table(can1$aim1a_selfrepAnx,can1$demo_gender)
+table(can1$aim1a_gad7_over10,can1$demo_gender)
+
+# CANADA
+######### CANADA
+
+# FEMALE
+# Aim 1a - def1
+
+test <- glm(as.factor(aim1a_ad_dsm5_scid_icd_cidi) ~ age + z_anx.s3 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,
+            subset=demo_gender==1, family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+# Aim 1a- def2
+
+test <- glm(as.factor(aim1a_selfrepAnx) ~ age + z_anx.s3 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,
+            subset=demo_gender==1, family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+# Aim 1a -def3
+
+test <- glm(as.factor(aim1a_gad7_over10) ~ age + z_anx.s3 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,
+            subset=demo_gender==1, family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+
+# ###### MALE
+# Aim 1a - def1
+
+test <- glm(as.factor(aim1a_ad_dsm5_scid_icd_cidi) ~ age + z_anx.s3 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,
+            subset=demo_gender==0, family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+# Aim 1a- def2
+
+test <- glm(as.factor(aim1a_selfrepAnx) ~ age + z_anx.s3 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,
+            subset=demo_gender==0, family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+# Aim 1a -def3
+
+test <- glm(as.factor(aim1a_gad7_over10) ~ age + z_anx.s3 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,
+            subset=demo_gender==0, family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+#########
+# USA
+#########
+table(usa1$status_a,usa1$gender)
+
+# FEMALE
+
+# Aim 1a- def2
+
+test <- glm(as.factor(status_a) ~ age + z_anx.s4 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=usa1,
+            subset=gender=="F", family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+# MALE
+# Aim 1a- def2
+
+test <- glm(as.factor(status_a) ~ age + z_anx.s4 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=usa1,
+            subset=gender=="M", family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+#### UKBB ######
+# FEMALE
+# outcome 2-DSMV
+test <- glm(as.factor(aim1a_outcome2) ~ age + anx_2020 + PC1 + PC2 + PC3 + PC4 + PC5, data=females, 
+            family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+# outcome 5-selfrepANX
+test <- glm(as.factor(aim1a_outcome5) ~ age + anx_2020 + PC1 + PC2 + PC3 + PC4 + PC5, data=females,
+            family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+#outcome 6-GAD7>=10
+test <- glm(as.factor(aim1a_outcome6) ~ age + anx_2020 + PC1 + PC2 + PC3 + PC4 + PC5, data=females,
+            family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+# MALE
+
+# SEX 2= female
+
+males <- full %>% filter(sex==1)
+
+# outcome 2-DSMV
+test <- glm(as.factor(aim1a_outcome2) ~ age + anx_2020 + PC1 + PC2 + PC3 + PC4 + PC5, data=males,
+            family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+# outcome 5-selfrepANX
+test <- glm(as.factor(aim1a_outcome5) ~ age + anx_2020 + PC1 + PC2 + PC3 + PC4 + PC5, data=males,
+            family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+#outcome 6-GAD7>=10
+test <- glm(as.factor(aim1a_outcome6) ~ age + anx_2020 + PC1 + PC2 + PC3 + PC4 + PC5, data=males,
+            family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+
+
+```
+
+# 6. Regression: PWMS vs. ANX no immune
+```{r}
+
+table(can1$aim1b_ad_dsm5_scid_icd_cidi)
+table(can1$aim1b_selfrepAnx)
+table(can1$aim1b_gad7_over10)
+
+#### CANADA
+
+# Aim 1a- def2 -  scid anx dsm5
+test <- glm(as.factor(aim1b_ad_dsm5_scid_icd_cidi) ~ z_anx.s3 + age + demo_gender +
+              PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,
+            family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+# Aim 1a - def5  -self rep anx
+test <- glm(as.factor(aim1b_selfrepAnx) ~  z_anx.s3 + age + demo_gender +
+              PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,
+            family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+# Aim 1a - def6 - gad-7 > 10
+test <- glm(as.factor(aim1b_gad7_over10) ~ age + demo_gender + z_anx.s3 +
+              PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,
+            family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+# no USA for this analyses
+# UKBB
+# outcome 2-DSMV
+test <- glm(as.factor(aim1b_outcome2) ~ age + sex + anx_2020 + PC1 + PC2 + PC3 + PC4 + PC5, data=full,
+            family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+# outcome 5-selfrepANX
+test <- glm(as.factor(aim1b_outcome5) ~ age + sex + anx_2020 + PC1 + PC2 + PC3 + PC4 + PC5, data=full,
+            family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+#outcome 6-GAD7>=10
+test <- glm(as.factor(aim1b_outcome6) ~ age + sex + anx_2020 + PC1 + PC2 + PC3 + PC4 + PC5, data=full,
+            family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+
+```
+
+# 7. Regression: Aim 1c-PWMS vs. HC
+```{r}
+################################################################################
+####### Selection of ANX PRS pT -GAD-2  ###### ###### ###### ###### ###### ###
+################################################################################
+# null
+test <- lm(gad2_comp ~ PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,subset=demo_disease!=5)
+summary(test)
+
+# S1
+test <- lm(gad2_comp ~ z_anx.s1 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,subset=demo_disease!=5)
+summary(test)
+
+# S2
+test <- lm(gad2_comp ~ z_anx.s2 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,subset=demo_disease!=5)
+summary(test)
+
+# S3 #HIGHEST
+test <- lm(gad2_comp ~ z_anx.s3 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,subset=demo_disease!=5)
+summary(test)
+
+# S4
+test <- lm(gad2_comp ~ z_anx.s4 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,subset=demo_disease!=5)
+summary(test)
+
+# S5
+test <- lm(gad2_comp ~ z_anx.s5 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,subset=demo_disease!=5)
+summary(test)
+
+# S6
+test <- lm(gad2_comp ~ z_anx.s6 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,subset=demo_disease!=5)
+summary(test)
+
+# S7
+test <- lm(gad2_comp ~ z_anx.s7 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,subset=demo_disease!=5)
+summary(test)
+
+# S8
+test <- lm(gad2_comp ~ z_anx.s8 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,subset=demo_disease!=5)
+summary(test)
+
+table(can1$aim1c_ad_dsm5)
+table(can1$aim1c_selfrepAnx)
+table(can1$aim1c_gad7_over10)
+
+# CANADA
+
+# Aim 1c - AD DSM5
+test <- glm(as.factor(aim1c_ad_dsm5) ~ age + demo_gender + z_anx.s3 +
+              PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,
+            family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+
+# Aim 1c - self report AD
+test <- glm(as.factor(aim1c_selfrepAnx) ~ age + demo_gender + z_anx.s3 +
+              PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,
+            family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+
+# Aim 1c - GAD7>10  
+test <- glm(as.factor(aim1c_gad7_over10) ~ age + demo_gender + z_anx.s3 +
+              PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,
+            family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+# NO USA FOR THIS OUTCOME
+
+# UKBB
+
+# outcome 2
+test <- glm(as.factor(aim1c_outcome2) ~ age + sex + anx_2020 + PC1 + PC2 + PC3 + PC4 + PC5, data=full,
+            family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+# outcome 5
+test <- glm(as.factor(aim1c_outcome5) ~ age + sex + anx_2020 + PC1 + PC2 + PC3 + PC4 + PC5, data=full, 
+            family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+# outcome 6
+test <- glm(as.factor(aim1c_outcome6) ~ age + sex + anx_2020 + PC1 + PC2 + PC3 + PC4 + PC5, data=full,
+            family="binomial")
+summary(test)
+exp(cbind("Odds ratio" = coef(test), confint.default(test, level = 0.95)))
+
+
+
+```
+
+# 8. Regression: GAD linear models
+```{r,eval=FALSE}
+# CANADA
+can1 <- can1 %>%
+  mutate(ad = ifelse(demo_disease == 5 | scid_ever_anx == 1, 1, 0),
+         ms = ifelse(demo_disease == 1, 1, 0))
+         
+can1$ad<-as.integer(can1$ad)
+can1$ms<-as.integer(can1$ms)
+
+can1 <- can1 %>%
+  mutate(interact_ad_selfrepAD_PRS.s4 = ad*z_anx_self.s4,
+         interact_ad_anxPRS.s3 = ad*z_anx.s3,
+         interact_MS_selfrepAD_PRS.s4 = ms*z_anx_self.s4,
+         interact_MS_anxPRS.s3 = ms*z_anx.s3
+         )
+
+can1$demo_disease <- as.factor(can1$demo_disease)
+can1$demo_disease <- relevel(can1$demo_disease, ref="6")
+
+# USA none
+
+# UKBB
+
+full <- full %>%
+  mutate(ad = ifelse(group == "anx", 1, 0),
+         ms = ifelse(group == "ms", 1, 0))
+         
+full$ad<-as.integer(full$ad)
+full$ms<-as.integer(full$ms)
+
+full <- full %>%
+  mutate(interact_ad_anxPRS = ad*anx_2020,
+         interact_MS_anxPRS = ms*anx_2020
+         )
+
+
+###### GAD2
+###### NO INTERACTION ##############
+test <- lm(gad2 ~ anx_2020 + as.factor(group2) + age + sex +
+             PC1 + PC2 + PC3 + PC4 + PC5, data=full)
+summary(test)
+
+###### W INTERACTION ##############
+test <- lm(gad2 ~ anx_2020 + group2 + age + sex + interact_ad_anxPRS + interact_MS_anxPRS + sex*anx_2020 +
+             PC1 + PC2 + PC3 + PC4 + PC5, data=full)
+summary(test)
+
+
+
+# GENDER STRAT
+test <- lm(gad2 ~ anx_2020 + as.factor(group2) + age +
+             PC1 + PC2 + PC3 + PC4 + PC5, data=full,subset=sex=="2") #female
+summary(test)
+test <- lm(gad2 ~ anx_2020 + as.factor(group2) + age +
+             PC1 + PC2 + PC3 + PC4 + PC5, data=full,subset=sex=="1") #male
+summary(test)
+```
+
+```{r,eval=F}
+# anx-s3 is best for gad-2 
+# model with PCs only 
+# NULL
+test <- lm(gad2_comp ~ PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1)
+summary(test)
+
+test <- lm(gad2_comp ~ z_anx.s1 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1)
+summary(test)
+
+test <- lm(gad2_comp ~ z_anx.s2 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1)
+summary(test)
+
+test <- lm(gad2_comp ~ z_anx.s3 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1)
+summary(test)
+
+test <- lm(gad2_comp ~ z_anx.s4 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1)
+summary(test)
+
+test <- lm(gad2_comp ~ z_anx.s5 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1)
+summary(test)
+
+test <- lm(gad2_comp ~ z_anx.s6 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1)
+summary(test)
+
+test <- lm(gad2_comp ~ z_anx.s7 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1)
+summary(test)
+
+test <- lm(gad2_comp ~ z_anx.s8 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1)
+summary(test)
+
+```
+
+```{r}
+###### GAD2
+###### FULL COHORT
+###### NO INTERACTION ##############
+test <- lm(gad2_comp ~ z_anx.s3 + demo_disease + age + demo_gender +
+             PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1)
+summary(test)
+
+###### W INTERACTION ##############
+test <- lm(gad2_comp ~ z_anx.s3 + demo_disease + age + demo_gender + demo_gender*z_anx.s3 + interact_ad_anxPRS.s3 + interact_MS_anxPRS.s3 + PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1)
+summary(test)
+
+# SEX STRAT
+###### NO INTERACTION ##############
+test <- lm(gad2_comp ~ z_anx.s3 + demo_disease + age +
+             PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,subset=demo_gender=="1")
+summary(test)
+
+test <- lm(gad2_comp ~ z_anx.s3 + demo_disease + age +
+             PC1_3sd + PC2_3sd + PC3_3sd + PC4_3sd + PC5_3sd, data=can1,subset=demo_gender=="0")
+summary(test)
+
+
+```
+
+
+# 9. Meta-analyses
+```{r}
+
+full <- readxl::read_xlsx("~/00-allcohorts-anx-aim1-5Oct2022.xlsx")
+
+### CATEGORICAL OUTCOMES
+### AIM 1a
+aim1a.2 <- full %>% filter(definition == "lifetime_dsm5") %>% filter(factor=="GAD2_PRS" & stratified =="no" & aim=="MS")
+res.fe <- rma(yi=estimate, sei=std.error, method="FE",data=aim1a.2)
+summary(res.fe)
+predict(res.fe, transf = exp, digits = 2)
+
+aim1a.6 <- full %>% filter(definition == "lifetime_selfreport") %>% filter(factor=="GAD2_PRS" & stratified =="no" & aim=="MS")
+res.fe <- rma(yi=estimate, sei=std.error, method="FE",data=aim1a.6)
+summary(res.fe)
+predict(res.fe, transf = exp, digits = 2)
+
+aim1a.4 <- full %>% filter(definition == "GAD7_10") %>% filter(factor=="GAD2_PRS" & stratified =="no" & aim=="MS")
+res.fe <- rma(yi=estimate, sei=std.error, method="FE",data=aim1a.4)
+summary(res.fe)
+predict(res.fe, transf = exp, digits = 2)
+
+
+###### SEX STRAT
+aim1a.2 <- full %>% filter(definition == "lifetime_dsm5" & stratified == "female" & aim =="MS") %>% filter(factor=="GAD2_PRS")
+res.fe <- rma(yi=estimate, sei=std.error, method="FE",data=aim1a.2)
+summary(res.fe)
+predict(res.fe, transf = exp, digits = 2)
+
+aim1a.6 <- full %>% filter(definition == "lifetime_selfreport" & stratified == "female"& aim =="MS") %>% filter(factor=="GAD2_PRS")
+res.fe <- rma(yi=estimate, sei=std.error, method="FE",data=aim1a.6)
+summary(res.fe)
+predict(res.fe, transf = exp, digits = 2)
+
+aim1a.4 <- full %>% filter(definition == "GAD7_10" & stratified == "female"& aim =="MS") %>% filter(factor=="GAD2_PRS")
+res.fe <- rma(yi=estimate, sei=std.error, method="FE",data=aim1a.4)
+summary(res.fe)
+predict(res.fe, transf = exp, digits = 2)
+
+
+aim1a.2 <- full %>% filter(definition == "lifetime_dsm5" & stratified == "male" & aim =="MS") %>% filter(factor=="GAD2_PRS")
+res.fe <- rma(yi=estimate, sei=std.error, method="FE",data=aim1a.2)
+summary(res.fe)
+predict(res.fe, transf = exp, digits = 2)
+
+aim1a.6 <- full %>% filter(definition == "lifetime_selfreport" & stratified == "male"& aim =="MS") %>% filter(factor=="GAD2_PRS")
+res.fe <- rma(yi=estimate, sei=std.error, method="FE",data=aim1a.6)
+summary(res.fe)
+predict(res.fe, transf = exp, digits = 2)
+
+aim1a.4 <- full %>% filter(definition == "GAD7_10" & stratified == "male"& aim =="MS") %>% filter(factor=="GAD2_PRS")
+res.fe <- rma(yi=estimate, sei=std.error, method="FE",data=aim1a.4)
+summary(res.fe)
+predict(res.fe, transf = exp, digits = 2)
+
+
+### AIM 1b
+
+aim1a.2 <- full %>% filter(definition == "lifetime_dsm5") %>% filter(factor=="GAD2_PRS" & stratified =="no" & aim=="anx")
+res.fe <- rma(yi=estimate, sei=std.error, method="FE",data=aim1a.2)
+summary(res.fe)
+predict(res.fe, transf = exp, digits = 2)
+
+aim1a.6 <- full %>% filter(definition == "lifetime_selfreport") %>% filter(factor=="GAD2_PRS" & stratified =="no" & aim=="anx")
+res.fe <- rma(yi=estimate, sei=std.error, method="FE",data=aim1a.6)
+summary(res.fe)
+predict(res.fe, transf = exp, digits = 2)
+
+aim1a.4 <- full %>% filter(definition == "GAD7_10") %>% filter(factor=="GAD2_PRS" & stratified =="no" & aim=="anx")
+res.fe <- rma(yi=estimate, sei=std.error, method="FE",data=aim1a.4)
+summary(res.fe)
+predict(res.fe, transf = exp, digits = 2)
+
+
+### AIM 1c
+
+aim1a.2 <- full %>% filter(definition == "lifetime_dsm5") %>% filter(factor=="GAD2_PRS" & stratified =="no" & aim=="hc")
+res.fe <- rma(yi=estimate, sei=std.error, method="FE",data=aim1a.2)
+summary(res.fe)
+predict(res.fe, transf = exp, digits = 2)
+
+aim1a.6 <- full %>% filter(definition == "lifetime_selfreport") %>% filter(factor=="GAD2_PRS" & stratified =="no" & aim=="hc")
+res.fe <- rma(yi=estimate, sei=std.error, method="FE",data=aim1a.6)
+summary(res.fe)
+predict(res.fe, transf = exp, digits = 2)
+
+aim1a.4 <- full %>% filter(definition == "GAD7_10") %>% filter(factor=="GAD2_PRS" & stratified =="no" & aim=="hc")
+res.fe <- rma(yi=estimate, sei=std.error, method="FE",data=aim1a.4)
+summary(res.fe)
+predict(res.fe, transf = exp, digits = 2)
+
+### CONTINUOUS OUTCOMES
+aim1a.2 <- full %>% filter(definition=="GAD2" & stratified =="no" & aim=="all")
+res.fe <- rma(yi=estimate, sei=std.error, method="FE",data=aim1a.2)
+summary(res.fe)
+
+aim1a.2 <- full %>% filter(definition=="MS" & stratified =="no" & aim=="all")
+res.fe <- rma(yi=estimate, sei=std.error, method="FE",data=aim1a.2)
+summary(res.fe)
+
+aim1a.2 <- full %>% filter(definition=="Anxiety" & stratified =="no" & aim=="all")
+res.fe <- rma(yi=estimate, sei=std.error, method="FE",data=aim1a.2)
+summary(res.fe)
+
+# SEX -FEMALE
+
+aim1a.2 <- full %>% filter(definition=="GAD2" & stratified =="female" & aim=="all")
+res.fe <- rma(yi=estimate, sei=std.error, method="FE",data=aim1a.2)
+summary(res.fe)
+
+aim1a.2 <- full %>% filter(definition=="MS" & stratified =="female" & aim=="all")
+res.fe <- rma(yi=estimate, sei=std.error, method="FE",data=aim1a.2)
+summary(res.fe)
+
+aim1a.2 <- full %>% filter(definition=="Anxiety" & stratified =="female" & aim=="all")
+res.fe <- rma(yi=estimate, sei=std.error, method="FE",data=aim1a.2)
+summary(res.fe)
+
+# SEX -MALE
+
+aim1a.2 <- full %>% filter(definition=="GAD2" & stratified =="male" & aim=="all")
+res.fe <- rma(yi=estimate, sei=std.error, method="FE",data=aim1a.2)
+summary(res.fe)
+
+aim1a.2 <- full %>% filter(definition=="MS" & stratified =="male" & aim=="all")
+res.fe <- rma(yi=estimate, sei=std.error, method="FE",data=aim1a.2)
+summary(res.fe)
+
+aim1a.2 <- full %>% filter(definition=="Anxiety" & stratified =="male" & aim=="all")
+res.fe <- rma(yi=estimate, sei=std.error, method="FE",data=aim1a.2)
+summary(res.fe)
+```
+
+# 10. Venn Diagram
+```{r, Venn Diagram,eval=F}
+
+library(ggvenn)
+
+table(can1$aim1a_ad_dsm5_scid_icd_cidi)
+table(can1$aim1a_selfrepAnx)
+table(can1$aim1a_gad7_over10)
+
+
+###### MS CANADA
+can1_venn_ms <- can1 %>%
+  filter(demo_disease==1) %>% # filter to only MS
+  mutate(aim1a_selfrepAnx=ifelse(is.na(aim1a_selfrepAnx),0,aim1a_selfrepAnx)) %>% # mutate 1 person who is NA for self-report
+  select(demo_studyid,aim1a_ad_dsm5_scid_icd_cidi,aim1a_selfrepAnx,aim1a_gad7_over10) %>%
+  mutate(flag_remove = case_when(aim1a_ad_dsm5_scid_icd_cidi==0 & aim1a_selfrepAnx==0 & aim1a_gad7_over10==0 ~ 0, TRUE ~1)) %>%
+  filter(flag_remove==1) %>%
+  select(-flag_remove) %>%
+  mutate(aim1a_ad_dsm5_scid_icd_cidi=ifelse(aim1a_ad_dsm5_scid_icd_cidi==1,TRUE,FALSE),
+         aim1a_selfrepAnx=ifelse(aim1a_selfrepAnx==1,TRUE,FALSE),
+        aim1a_gad7_over10=ifelse(aim1a_gad7_over10==1,TRUE,FALSE),
+           ) %>%
+  rename(`Lifetime DSM-V\nanxiety disorders`=aim1a_ad_dsm5_scid_icd_cidi,
+         `Self-reported\nanxiety`=aim1a_selfrepAnx,
+         `GAD-7 ≥ 10`=aim1a_gad7_over10)
+
+x <- ggplot(can1_venn_ms) +
+  geom_venn(aes(A = `Lifetime DSM-V\nanxiety disorders`, B = `Self-reported\nanxiety`, C = `GAD-7 ≥ 10`)) +
+  coord_fixed() +
+  theme_void() 
+
+######### ANX CANADA
+
+table(can1$aim1b_ad_dsm5_scid_icd_cidi)
+table(can1$aim1b_selfrepAnx)
+table(can1$aim1b_gad7_over10)
+can1_venn_anx <- can1 %>%
+  filter(str_starts(demo_studyid, "4")) %>%
+  select(demo_studyid,aim1b_ad_dsm5_scid_icd_cidi,aim1b_selfrepAnx,aim1b_gad7_over10) %>%
+  mutate(aim1b_ad_dsm5_scid_icd_cidi=ifelse(aim1b_ad_dsm5_scid_icd_cidi==0,TRUE,FALSE),
+         aim1b_selfrepAnx=ifelse(aim1b_selfrepAnx==0,TRUE,FALSE),
+         aim1b_gad7_over10=ifelse(aim1b_gad7_over10==0,TRUE,FALSE),
+          aim1b_gad7_over10=ifelse(is.na(aim1b_gad7_over10),FALSE,aim1b_gad7_over10)
+         ) %>%
+ rename(`Lifetime DSM-V\nanxiety disorders`=aim1b_ad_dsm5_scid_icd_cidi,
+         `Self-reported\nanxiety`=aim1b_selfrepAnx,
+         `GAD-7 ≥ 10`=aim1b_gad7_over10)
+
+x1 <- ggplot(can1_venn_anx) +
+  geom_venn(aes(A = `Lifetime DSM-V\nanxiety disorders`, B = `Self-reported\nanxiety`, C = `GAD-7 ≥ 10`)) +
+  coord_fixed() +
+  theme_void() 
+
+
+library(cowplot)
+fp12 <- plot_grid(x,x1, labels = c("A: Canada-Multiple sclerosis", "B: Canada-Anxiety, no immune disease"), nrow = 1, align = "h", axis='l')
+
+fp12
+
+save_plot("00-can-anx-venn-9jun23.png", fp12,
+         nrow = 3, ncol = 2, # and 2 rows
+# each individual subplot should have an aspect ratio of 1.3
+base_aspect_ratio = 2)
+
+
+###############
+####### UKBB
+###############
+
+###### MS
+table(full$aim1a_outcome2)
+table(full$aim1a_outcome5)
+table(full$aim1a_outcome6)
+
+
+venn_ms <- full %>%
+  filter(table1filter=="MS-anx") %>% # filter to only MS
+  select(f.eid,aim1a_outcome2,aim1a_outcome5,aim1a_outcome6) %>%
+  mutate(flag_remove = case_when(aim1a_outcome2==0 & aim1a_outcome5==0 & aim1a_outcome6==0 ~ 0, TRUE ~1)) %>%
+  filter(flag_remove==1) %>%
+  select(-flag_remove) %>%
+  mutate(aim1a_outcome2=ifelse(aim1a_outcome2==0 | is.na(aim1a_outcome2) ,FALSE,TRUE),
+         aim1a_outcome5=ifelse(aim1a_outcome5==0 | is.na(aim1a_outcome5) ,FALSE,TRUE),
+        aim1a_outcome6=ifelse(aim1a_outcome6==0 | is.na(aim1a_outcome6) ,FALSE,TRUE),
+           ) %>%
+  rename(`Lifetime DSM-V\nanxiety disorders`=aim1a_outcome2,
+         `Self-reported\nanxiety`=aim1a_outcome5,
+         `GAD-7 ≥ 10`=aim1a_outcome6)
+
+x <- ggplot(venn_ms) +
+  geom_venn(aes(A = `Lifetime DSM-V\nanxiety disorders`, B = `Self-reported\nanxiety`, C = `GAD-7 ≥ 10`)) +
+  coord_fixed() +
+  theme_void() 
+
+######### ANX
+
+venn_anx <- full %>%
+  filter(table1filter=="ANX") %>% # filter to only ANX
+  select(f.eid,aim1b_outcome2,aim1b_outcome5,aim1b_outcome6) %>%
+  mutate(flag_remove = case_when(aim1b_outcome2==0 & aim1b_outcome5==0 & aim1b_outcome6==0 ~ 0, TRUE ~1)) %>%
+  filter(flag_remove==1) %>%
+  select(-flag_remove) %>%
+  mutate(aim1b_outcome2=ifelse(is.na(aim1b_outcome2) ,FALSE,TRUE),
+        aim1b_outcome5=ifelse(is.na(aim1b_outcome5) ,FALSE,TRUE),
+       aim1b_outcome6=ifelse(is.na(aim1b_outcome6) ,FALSE,TRUE),
+           ) %>%
+  rename(`Lifetime DSM-V\nanxiety disorders`=aim1b_outcome2,
+         `Self-reported\nanxiety`=aim1b_outcome5,
+         `GAD-7 ≥ 10`=aim1b_outcome6)
+
+x1 <- ggplot(venn_anx) +
+  geom_venn(aes(A = `Lifetime DSM-V\nanxiety disorders`, B = `Self-reported\nanxiety`, C = `GAD-7 ≥ 10`)) +
+  coord_fixed() +
+  theme_void() 
+
+
+library(cowplot)
+fp12 <- plot_grid(x,x1, labels = c("A: UKBB-Multiple sclerosis", "B: UKBB-Anxiety, no immune disease"), nrow = 1, align = "h", axis='l')
+
+fp12
+
+save_plot("00-ukbb-anx-venn-13jun23.png", fp12,
+         nrow = 3, ncol = 2, # and 2 rows
+# each individual subplot should have an aspect ratio of 1.3
+base_aspect_ratio = 2)
+
+```
